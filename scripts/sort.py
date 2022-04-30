@@ -15,23 +15,28 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-from __future__ import print_function
 
+# basic libraries import
 import os
-from typing import Any
+import glob
+import time
+import argparse
 import numpy as np
+from typing import Any, List
+
+# plotting libraries import
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from skimage import io
 
-import glob
-import time
-import argparse
+# KF library
 from filterpy.kalman import KalmanFilter
 
+# SET SEED TO GET REPRODUCIBLE RESULTLS
 np.random.seed(0)
+
 
 
 def linear_assignment(cost_matrix) -> np.ndarray:
@@ -181,8 +186,11 @@ def convert_x_to_bbox(x : np.ndarray, score : Any=None) -> np.ndarray:
                      score]).reshape((1,5))
 
 
+
 class KalmanBoxTracker(object):
+  # static variable that keeps track of tracks initialized
   count = 0
+
   def __init__(self,bbox : np.ndarray) -> None:
     """ This class represents the internal state of individual
     tracked objects observed as bbox.  Initialises a tracker 
@@ -239,7 +247,8 @@ class KalmanBoxTracker(object):
     self.id = KalmanBoxTracker.count
     KalmanBoxTracker.count += 1
 
-    # track management variables
+    # these variables keep track of predicted states
+    # when there's no measurement associated to this track
     self.time_since_update = 0
     self.history = []
 
@@ -259,7 +268,9 @@ class KalmanBoxTracker(object):
         bbox (np.ndarray): (5,) vector representing bounding box
         top left and bottom right x,y coordinates and confidence
     """
-    # reset history related varibles
+    # since the object's associated to a measurement,
+    # reset history related varibles, containing predicted
+    # states information
     self.time_since_update = 0
     self.history = []
     self.hits += 1
@@ -287,63 +298,95 @@ class KalmanBoxTracker(object):
     self.kf.predict()
     self.age += 1
 
-    # if no state
+    # reset `updated` status, setting hit_streak 
+    # to 0 indicates, at least 1 timestamp has passed where 
+    # track hasn't been associated to a measurement
     if(self.time_since_update>0):
       self.hit_streak = 0
     self.time_since_update += 1
+
+    # keep track of predicted states, returning 
+    # the latest one
     self.history.append(convert_x_to_bbox(self.kf.x))
     return self.history[-1]
 
-  def get_state(self):
-    """
-    Returns the current bounding box estimate.
-    """
+
+  def get_state(self) -> np.ndarray:
+    """ Function returns the current bounding box estimate 
+    Returns:
+        np.ndarray: most recent estimate of target bbox in
+        [x1,y1,x2,y2] format
+    """    
     return convert_x_to_bbox(self.kf.x)
 
 
-def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
-  """
-  Assigns detections to tracked object (both represented as bounding boxes)
 
-  Returns 3 lists of matches, unmatched_detections and unmatched_trackers
+
+def associate_detections_to_trackers(detections : np.ndarray, trackers : np.ndarray,
+                iou_threshold : float = 0.3) -> List[Any]:
+  """ Assigns detections to tracked object (both represented as bounding boxes)
+
+  Args:
+      detections (np.ndarray): _description_
+      trackers (np.ndarray): _description_
+      iou_threshold (float, optional): minimum iou metric to consider as 
+      valid match. Defaults to 0.3.
+
+  Returns:
+      matches, unmatched_detections and unmatched_trackers (List[Any]): 
+      matches = (M,2) array where each row contains index of matched 
+      track and detection.
+        
+      unmatched_detections - list containing indices of detections for 
+      which no tracks was associated
+
+      unmatched_trackers - list containing indices of tracks for 
+      which no detection was associated
   """
+  # assume trackers shape = (), detections shape = ()
+
+  # empty tracks scenario, return empty matched matrix
+  # indices of all detections and tracks 
   if(len(trackers)==0):
     return np.empty((0,2),dtype=int), np.arange(len(detections)), np.empty((0,5),dtype=int)
 
-  iou_matrix = iou_batch(detections, trackers)
-
-  if min(iou_matrix.shape) > 0:
-    a = (iou_matrix > iou_threshold).astype(np.int32)
-    if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-        matched_indices = np.stack(np.where(a), axis=1)
-    else:
-      matched_indices = linear_assignment(-iou_matrix)
+  # if not empty
   else:
-    matched_indices = np.empty(shape=(0,2))
+    # find the overlap between bbox of tracks, measurements
+    iou_matrix = iou_batch(detections, trackers)
 
-  unmatched_detections = []
-  for d, det in enumerate(detections):
-    if(d not in matched_indices[:,0]):
-      unmatched_detections.append(d)
-  unmatched_trackers = []
-  for t, trk in enumerate(trackers):
-    if(t not in matched_indices[:,1]):
-      unmatched_trackers.append(t)
-
-  #filter out matched with low IOU
-  matches = []
-  for m in matched_indices:
-    if(iou_matrix[m[0], m[1]]<iou_threshold):
-      unmatched_detections.append(m[0])
-      unmatched_trackers.append(m[1])
+    if min(iou_matrix.shape) > 0:
+      a = (iou_matrix > iou_threshold).astype(np.int32)
+      if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+          matched_indices = np.stack(np.where(a), axis=1)
+      else:
+        matched_indices = linear_assignment(-iou_matrix)
     else:
-      matches.append(m.reshape(1,2))
-  if(len(matches)==0):
-    matches = np.empty((0,2),dtype=int)
-  else:
-    matches = np.concatenate(matches,axis=0)
+      matched_indices = np.empty(shape=(0,2))
 
-  return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
+    unmatched_detections = []
+    for d, det in enumerate(detections):
+      if(d not in matched_indices[:,0]):
+        unmatched_detections.append(d)
+    unmatched_trackers = []
+    for t, trk in enumerate(trackers):
+      if(t not in matched_indices[:,1]):
+        unmatched_trackers.append(t)
+
+    #filter out matched with low IOU
+    matches = []
+    for m in matched_indices:
+      if(iou_matrix[m[0], m[1]]<iou_threshold):
+        unmatched_detections.append(m[0])
+        unmatched_trackers.append(m[1])
+      else:
+        matches.append(m.reshape(1,2))
+    if(len(matches)==0):
+      matches = np.empty((0,2),dtype=int)
+    else:
+      matches = np.concatenate(matches,axis=0)
+
+    return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
 
 
 class Sort(object):
@@ -402,6 +445,9 @@ class Sort(object):
       return np.concatenate(ret)
     return np.empty((0,5))
 
+
+
+
 def parse_args():
     """Parse input arguments."""
     parser = argparse.ArgumentParser(description='SORT demo')
@@ -417,6 +463,9 @@ def parse_args():
     parser.add_argument("--iou_threshold", help="Minimum IOU for match.", type=float, default=0.3)
     args = parser.parse_args()
     return args
+
+
+
 
 if __name__ == '__main__':
   # all train
