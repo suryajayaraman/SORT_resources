@@ -148,7 +148,7 @@ def convert_bbox_to_z(bbox : np.ndarray) -> np.ndarray:
   x = bbox[0] + w/2.       # x-coordinate of centre of bbox
   y = bbox[1] + h/2.       # y-coordinate of centre of bbox
   s = w * h                # s = bbox area
-  r = w / float(h)         # w = width to height aspect ratio
+  r = w / float(h)         # r = width to height aspect ratio
   return np.array([x, y, s, r]).reshape((4, 1))
 
 
