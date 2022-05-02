@@ -327,8 +327,9 @@ def associate_detections_to_trackers(detections : np.ndarray, trackers : np.ndar
   """ Assigns detections to tracked object (both represented as bounding boxes)
 
   Args:
-      detections (np.ndarray): _description_
-      trackers (np.ndarray): _description_
+      detections (np.ndarray): (N,5) array where each row indicates detections in 
+      [x1,y1,x2,y2,confidence] format
+      trackers (np.ndarray): (M,5) array where each row contains track states vector
       iou_threshold (float, optional): minimum iou metric to consider as 
       valid match. Defaults to 0.3.
 
@@ -343,7 +344,8 @@ def associate_detections_to_trackers(detections : np.ndarray, trackers : np.ndar
       unmatched_trackers - list containing indices of tracks for 
       which no detection was associated
   """
-  # assume trackers shape = (), detections shape = ()
+  # assume trackers shape = (6,5), detections shape = (7,5)
+  # means there are 6 tracks and 7 measurements
 
   # empty tracks scenario, return empty matched matrix
   # indices of all detections and tracks 
@@ -353,27 +355,50 @@ def associate_detections_to_trackers(detections : np.ndarray, trackers : np.ndar
   # if not empty
   else:
     # find the overlap between bbox of tracks, measurements
+    # iou_matrix shape = (7,6) where each entry range = [0,1]
     iou_matrix = iou_batch(detections, trackers)
 
+    # if at least there is one matched association
     if min(iou_matrix.shape) > 0:
+      
+      # ensure the returned matrix is valid by ensuring
+      # sum across every row and column sums to 1
+      # a shape = (7,6), int array containing 0s and 1s
       a = (iou_matrix > iou_threshold).astype(np.int32)
+      
+      # simple case where the overlap itself is enough to solve
+      # the data association problem, i.e there is only one 1 in
+      # each row / column. If so, directly stack the indices
       if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+
+          # store indices where iou matrix is greater than threshold
+          # and stack them row wise. eg : matched_indices shape = (6,2)
+          # means there are 6 track-detection association from iou_matrix
           matched_indices = np.stack(np.where(a), axis=1)
+      
       else:
         matched_indices = linear_assignment(-iou_matrix)
     else:
       matched_indices = np.empty(shape=(0,2))
 
+
+    # store indices of detections not associated to any track
     unmatched_detections = []
     for d, det in enumerate(detections):
       if(d not in matched_indices[:,0]):
         unmatched_detections.append(d)
+
+    # store indices of tracks not associated to any detection
     unmatched_trackers = []
     for t, trk in enumerate(trackers):
       if(t not in matched_indices[:,1]):
         unmatched_trackers.append(t)
 
-    #filter out matched with low IOU
+    # filter out matched with low IOU
+    # and store those entries too in ummatched_ lists
+    # matches shape = matched_indices shape = (6,2)
+    # unmatched_detections = list of indices of unassociated detections
+    # unmatched_trackers = list of indices of unassociated trackers
     matches = []
     for m in matched_indices:
       if(iou_matrix[m[0], m[1]]<iou_threshold):
@@ -389,40 +414,85 @@ def associate_detections_to_trackers(detections : np.ndarray, trackers : np.ndar
     return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
 
 
+
+
 class Sort(object):
-  def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3):
-    """
-    Sets key parameters for SORT
+  def __init__(self, max_age : int=1, min_hits : int=3, iou_threshold : float =0.3) -> None:
+    """ Sets parameters for SORT algorithm to setup Multi-Object 
+    Tracker. The tracker computes data association using hungarian
+    algorithm on intersection over union (IoU) b/w bboxes of 
+    consecutive frames.
+
+    `self.trackers = List[KalmanBoxTracker] represents list of tracked objects`
+
+    Args:
+        max_age (int, optional): Number of frames to consider when object is
+        not detected. Defaults to 1.
+        min_hits (int, optional): Number of frames to consider a track as confirmed. Defaults to 3.
+        iou_threshold (float, optional): threhsold to consider a detection-track
+        pair as valid association. Defaults to 0.3.
     """
     self.max_age = max_age
     self.min_hits = min_hits
     self.iou_threshold = iou_threshold
-    self.trackers = []
     self.frame_count = 0
 
-  def update(self, dets=np.empty((0, 5))):
-    """
-    Params:
-      dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...]
-    Requires: this method must be called once for each frame even with empty detections (use np.empty((0, 5)) for frames without detections).
-    Returns the a similar array, where the last column is the object ID.
+    # placeholder for keeping list of tracks
+    self.trackers = []
+    
 
-    NOTE: The number of objects returned may differ from the number of detections provided.
-    """
+
+  def update(self, dets : np.ndarray=np.empty((0, 5))) -> np.ndarray:
+    """ Function updates internal set of tracks using input measurements.
+    This function must be called once for each frame. Returns the a similar 
+    array, where the last column is the object ID. 
+
+    NOTE: 
+    1. The number of objects returned may differ from the number of detections provided.
+    2. For frames without detections, empty array (use np.empty((0, 5)) must be passed
+
+    Args:
+        dets (np.ndarray, optional): (N,5) array of detections
+        in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...]. 
+        Defaults to np.empty((0, 5)).
+
+    Returns:
+        np.ndarray: (M,5) where each row contains [x1,y1,x2,y2,trackID] 
+        of a confirmed object
+    """    
     self.frame_count += 1
-    # get predicted locations from existing trackers.
+    
+    # assume self.trackers = (6,) length list
+    # placeholder to store get predicted locations
+    # from existing trackers. trks shape = (6,5)
     trks = np.zeros((len(self.trackers), 5))
+
+    # placeholder for indices of tracks to be deleted
     to_del = []
-    ret = []
+
+    # iterate through existing tracks and 
+    # predict each independently. If any track goes
+    # out of FOV, consider it to be deleted
     for t, trk in enumerate(trks):
       pos = self.trackers[t].predict()[0]
       trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
       if np.any(np.isnan(pos)):
         to_del.append(t)
+
+    # filter only rows containing full of valid entries 
     trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+
+    # remove tracks deleted tracks from list
     for t in reversed(to_del):
       self.trackers.pop(t)
+
+    # associate tracks to measurements
+    # matched = (N,2) where 1st column indicates row index
+    # and 2nd column indicates associated column index.
+    # unmatched_dets = (M,) length list containing indices of unassociated detections
+    # unmatched_trks = (P,) length list containing indices of unassociated tracks
     matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets,trks, self.iou_threshold)
+
 
     # update matched trackers with assigned detections
     for m in matched:
@@ -432,15 +502,29 @@ class Sort(object):
     for i in unmatched_dets:
         trk = KalmanBoxTracker(dets[i,:])
         self.trackers.append(trk)
+    
+    # initialize return variable, list of confirmed tracks.
+    ret = []
     i = len(self.trackers)
+
+    # iterate through existing tracks
     for trk in reversed(self.trackers):
+        # d = (4,) length vector containing [x1,y1,x2,y2]
+        # bbox coordinates
         d = trk.get_state()[0]
+
+        # Conditions for track to be confirmed
+        # 1. associated to detection in latest frame
+        # 2. hit_streak >= min_hits
         if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
           ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
         i -= 1
+
         # remove dead tracklet
         if(trk.time_since_update > self.max_age):
           self.trackers.pop(i)
+
+    # return stacked tracks of shape (M,5)
     if(len(ret)>0):
       return np.concatenate(ret)
     return np.empty((0,5))
@@ -448,33 +532,42 @@ class Sort(object):
 
 
 
-def parse_args():
-    """Parse input arguments."""
-    parser = argparse.ArgumentParser(description='SORT demo')
-    parser.add_argument('--display', dest='display', help='Display online tracker output (slow) [False]',action='store_true')
-    parser.add_argument("--seq_path", help="Path to detections.", type=str, default='data')
-    parser.add_argument("--phase", help="Subdirectory in seq_path.", type=str, default='train')
-    parser.add_argument("--max_age", 
-                        help="Maximum number of frames to keep alive a track without associated detections.", 
-                        type=int, default=1)
-    parser.add_argument("--min_hits", 
-                        help="Minimum number of associated detections before track is initialised.", 
-                        type=int, default=3)
-    parser.add_argument("--iou_threshold", help="Minimum IOU for match.", type=float, default=0.3)
-    args = parser.parse_args()
-    return args
+def parse_args() -> argparse.ArgumentParser:
+  """ Parse input arguments from CLI 
+  Returns:
+      argparse.ArgumentParser: object with input arguments
+  """  
+  parser = argparse.ArgumentParser(description='SORT demo')
+  parser.add_argument('--display', dest='display', help='Display online tracker output (slow) [False]',action='store_true')
+  parser.add_argument("--seq_path", help="Path to detections.", type=str, default='data')
+  parser.add_argument("--phase", help="Subdirectory in seq_path.", type=str, default='train')
+  parser.add_argument("--max_age", 
+                      help="Maximum number of frames to keep alive a track without associated detections.", 
+                      type=int, default=1)
+  parser.add_argument("--min_hits", 
+                      help="Minimum number of associated detections before track is initialised.", 
+                      type=int, default=3)
+  parser.add_argument("--iou_threshold", help="Minimum IOU for match.", type=float, default=0.3)
+  args = parser.parse_args()
+  return args
 
 
 
 
 if __name__ == '__main__':
-  # all train
+  # parse CL arguments
   args = parse_args()
   display = args.display
   phase = args.phase
+
+  # temporary variables
   total_time = 0.0
   total_frames = 0
   colours = np.random.rand(32, 3) #used only for display
+  
+  # if display = true
+  #   1. check if images exist
+  #   2. create figure handles
   if(display):
     if not os.path.exists('mot_benchmark'):
       print('\n\tERROR: mot_benchmark link not found!\n\n    Create a symbolic link to the MOT benchmark\n    (https://motchallenge.net/data/2D_MOT_2015/#download). E.g.:\n\n    $ ln -s /path/to/MOT2015_challenge/2DMOT2015 mot_benchmark\n\n')
@@ -483,42 +576,76 @@ if __name__ == '__main__':
     fig = plt.figure()
     ax1 = fig.add_subplot(111, aspect='equal')
 
+  # create output directory if not already exists
   if not os.path.exists('output'):
     os.makedirs('output')
+  
+  
   # pattern = path to folder containing detection text files for the 
-  # scenario
+  # folder structure
+  # seq_path (data/)
+  #     phase (train/)
+  #         pattern (ADL-Rundle-6/)
+  #             det/det.txt
+  #         pattern (ADL-Rundle-8/)
+  #             det/det.txt
+  #         ..........
   pattern = os.path.join(args.seq_path, phase, '*', 'det', 'det.txt')
-  print(pattern)
+
+  # iterate through each folder
   for seq_dets_fn in glob.glob(pattern):
+    # create SORT Tracker object with input arguments
     mot_tracker = Sort(max_age=args.max_age, 
                        min_hits=args.min_hits,
-                       iou_threshold=args.iou_threshold) #create instance of the SORT tracker
+                       iou_threshold=args.iou_threshold) 
+    
+    # load detections for scenario as np array
+    # seq_dets = (N,10) array in MOT benchmark format. 
+    # <frame_no, id, bbx, bby, bbw, bbh, conf, x, y, z>
+    # The number of frames M is lesser compared to number of
+    # detection N because there can be many objects in single frame
     seq_dets = np.loadtxt(seq_dets_fn, delimiter=',')
+
+    # seq is string = name of scenario. eg: ADL-Rundle-6
     seq = seq_dets_fn[pattern.find('*'):].split(os.path.sep)[0]
     
+    # file handle for writing output
     with open(os.path.join('output', '%s.txt'%(seq)),'w') as out_file:
       print("Processing %s."%(seq))
+
+      # iterate through each frame in scenario
       for frame in range(int(seq_dets[:,0].max())):
-        frame += 1 #detection and frame numbers begin at 1
+        # detection and frame numbers begin at 1
+        frame += 1 
+
+        # filter detections belonging to this frame
+        # dets = (P,5) where P = number of detections in that frame
         dets = seq_dets[seq_dets[:, 0]==frame, 2:7]
-        dets[:, 2:4] += dets[:, 0:2] #convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+
+        # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+        dets[:, 2:4] += dets[:, 0:2] 
         total_frames += 1
 
+        # show corresponding image if display = true
         if(display):
           fn = os.path.join('mot_benchmark', phase, seq, 'img1', '%06d.jpg'%(frame))
           im =io.imread(fn)
           ax1.imshow(im)
           plt.title(seq + ' Tracked Targets')
 
+        # Call tracker update fn with latest measurements to get list
+        # of tracked objects. trackers = (T,5) in [x1,y1,x2,y2,id] format
         start_time = time.time()
         trackers = mot_tracker.update(dets)
         cycle_time = time.time() - start_time
         total_time += cycle_time
 
+        # write output to file
         for d in trackers:
           print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1'%(frame,d[4],d[0],d[1],d[2]-d[0],d[3]-d[1]),file=out_file)
           if(display):
             d = d.astype(np.int32)
+            # indicate bbox of tracked object
             ax1.add_patch(patches.Rectangle((d[0],d[1]),d[2]-d[0],d[3]-d[1],fill=False,lw=3,ec=colours[d[4]%32,:]))
 
         if(display):
